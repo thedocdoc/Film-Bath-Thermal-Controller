@@ -1,0 +1,266 @@
+/*
+ * FILM DEVELOPER THERMOSTAT
+ * Second Robotics LLC
+ *
+ * Hardcoded for B&W film chemistry water bath control
+ * Target: 20.0°C / 68.0°F (Ilford standard process temp)
+ *
+ * Hardware:
+ *   Arduino Nano ATmega328P (CH340C, Type-C)
+ *   MAX31856 Thermocouple Amplifier (K-type)
+ *   0.91" 128x32 SSD1306 OLED (I2C, U8g2)
+ *   Relay 1 HEAT -> D2 (active high)
+ *   Relay 2 SPARE -> D3 (active high, reserved, maybe 12v pump in ice bucket)
+ *
+ * Pin Assignments:
+ *   MAX31856 CLK  -> D13
+ *   MAX31856 MISO -> D12 (SDO)
+ *   MAX31856 MOSI -> D11 (SDI)
+ *   MAX31856 CS   -> D10
+ *   OLED SDA      -> A4
+ *   OLED SCL      -> A5
+ *   RELAY HEAT    -> D2
+ *   RELAY SPARE   -> D3
+ *
+ * Libraries:
+ *   Adafruit MAX31856
+ *   U8g2
+ */
+
+#include <SPI.h>
+#include <Wire.h>
+#include <Adafruit_MAX31856.h>
+#include <U8g2lib.h>
+
+// ── Pins ──────────────────────────────────────────────────────────────
+#define MAX_CS       10
+#define RELAY_HEAT    2
+#define RELAY_SPARE   3
+
+#define RELAY_ON    HIGH
+#define RELAY_OFF   LOW
+
+// ── Developer Hardcoded Config ────────────────────────────────────────
+// Ilford chemistry standard process temp
+const float SETPOINT_C   = 20.0;   // °C
+const float SETPOINT_F   = 68.0;   // °F
+const float HYSTERESIS   =  0.3;   // °C — tight band for chemistry accuracy
+const float CAL_OFFSET   = -1.6;   // measured with real world ice surry 
+
+// Soak timer — counts up from when bath first hits temp
+// Useful for tracking development time
+#define SOAK_TIMER_ENABLED true
+
+// ── Display ───────────────────────────────────────────────────────────
+U8G2_SSD1306_128X32_UNIVISION_1_HW_I2C u8g2(U8G2_R0, U8X8_PIN_NONE);
+
+// ── MAX31856 ──────────────────────────────────────────────────────────
+Adafruit_MAX31856 tc = Adafruit_MAX31856(MAX_CS);
+
+// ── State ─────────────────────────────────────────────────────────────
+float   tempC         = 0.0;
+float   tempF         = 0.0;
+bool    heatOn        = false;
+bool    sensorFault   = false;
+bool    atTemp        = false;        // True when bath is within ±HYSTERESIS of setpoint
+
+unsigned long lastReadTime   = 0;
+unsigned long atTempSince    = 0;     // millis() when we first hit setpoint
+const unsigned long READ_INTERVAL = 500;
+
+// ── Timing helper ─────────────────────────────────────────────────────
+// Returns formatted mm:ss string into buf (must be >= 6 bytes)
+void formatTime(unsigned long ms, char* buf) {
+  unsigned long total = ms / 1000;
+  unsigned int  mins  = total / 60;
+  unsigned int  secs  = total % 60;
+  sprintf(buf, "%02u:%02u", mins, secs);
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void setup() {
+  Serial.begin(115200);
+  Serial.println(F("Film Dev Thermostat — Second Robotics LLC"));
+
+  // Relays off at boot
+  pinMode(RELAY_HEAT,  OUTPUT);
+  pinMode(RELAY_SPARE, OUTPUT);
+  digitalWrite(RELAY_HEAT,  RELAY_OFF);
+  digitalWrite(RELAY_SPARE, RELAY_OFF);
+
+  // Display init
+  u8g2.begin();
+  u8g2.firstPage();
+  do {
+    u8g2.setFont(u8g2_font_6x10_tr);
+    u8g2.setCursor(0, 10);
+    u8g2.print(F("Second Robotics LLC"));
+    u8g2.setCursor(0, 22);
+    u8g2.print(F("Film Dev Therm v1.0"));
+    u8g2.setCursor(0, 32);
+    u8g2.print(F("Init..."));
+  } while (u8g2.nextPage());
+  delay(1500);
+
+  // MAX31856 init
+  if (!tc.begin()) {
+    Serial.println(F("MAX31856 FAIL — check SPI"));
+    u8g2.firstPage();
+    do {
+      u8g2.setFont(u8g2_font_6x10_tr);
+      u8g2.setCursor(0, 10);
+      u8g2.print(F("MAX31856 FAIL"));
+      u8g2.setCursor(0, 22);
+      u8g2.print(F("Check SPI wiring"));
+    } while (u8g2.nextPage());
+    while (true);
+  }
+
+  tc.setThermocoupleType(MAX31856_TCTYPE_K);
+  Serial.println(F("MAX31856 OK — K-type"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void loop() {
+  unsigned long now = millis();
+
+  if (now - lastReadTime >= READ_INTERVAL) {
+    lastReadTime = now;
+    readThermocouple();
+    controlRelay(now);
+    updateDisplay(now);
+    printSerial();
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void readThermocouple() {
+  uint8_t fault = tc.readFault();
+  if (fault) {
+    sensorFault = true;
+    Serial.print(F("TC FAULT: 0x"));
+    Serial.println(fault, HEX);
+    return;
+  }
+  sensorFault = false;
+  tempC = tc.readThermocoupleTemperature() + CAL_OFFSET;
+  tempF = (tempC * 9.0 / 5.0) + 32.0;
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void controlRelay(unsigned long now) {
+  if (sensorFault) {
+    digitalWrite(RELAY_HEAT, RELAY_OFF);
+    heatOn  = false;
+    atTemp  = false;
+    return;
+  }
+
+  float upper = SETPOINT_C + HYSTERESIS;
+  float lower = SETPOINT_C - HYSTERESIS;
+
+  // Hysteresis control
+  if (tempC < lower)         heatOn = true;
+  else if (tempC >= SETPOINT_C) heatOn = false;
+
+  digitalWrite(RELAY_HEAT, heatOn ? RELAY_ON : RELAY_OFF);
+
+  // At-temp tracking for soak timer
+  bool wasAtTemp = atTemp;
+  atTemp = (tempC >= lower && tempC <= upper);
+
+  if (atTemp && !wasAtTemp) {
+    atTempSince = now;   // Just hit temp — start soak timer
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void updateDisplay(unsigned long now) {
+  u8g2.firstPage();
+  do {
+    if (sensorFault) {
+      displayFault();
+    } else {
+      displayNormal(now);
+    }
+  } while (u8g2.nextPage());
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void displayNormal(unsigned long now) {
+  // Row 1: Current temp large
+  u8g2.setFont(u8g2_font_9x15_tr);
+  u8g2.setCursor(0, 14);
+
+  char buf[8];
+  dtostrf(tempC, 4, 1, buf);
+  u8g2.print(buf);
+  u8g2.print(F("\xb0" "C"));   // degree C
+
+  // Setpoint small, right side
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(82, 10);
+  u8g2.print(F("SP:"));
+  dtostrf(SETPOINT_C, 4, 1, buf);
+  u8g2.print(buf);
+
+  // Row 2: Status + soak timer
+  u8g2.setCursor(0, 26);
+
+  if (heatOn) {
+    u8g2.print(F("[HEAT] "));
+  } else if (atTemp) {
+    u8g2.print(F("[AT TEMP] "));
+  } else {
+    u8g2.print(F("[IDLE]  "));
+  }
+
+  // Soak timer — only shows once at temp
+  if (atTemp && SOAK_TIMER_ENABLED) {
+    char tbuf[6];
+    formatTime(now - atTempSince, tbuf);
+    u8g2.setCursor(72, 26);
+    u8g2.print(tbuf);
+  }
+
+  // Row 3: delta from setpoint + Fahrenheit
+  u8g2.setCursor(0, 32);
+  float delta = tempC - SETPOINT_C;
+  if (delta >= 0) u8g2.print(F("+"));
+  dtostrf(delta, 3, 1, buf);
+  u8g2.print(buf);
+  u8g2.print(F("\xb0  "));
+
+  dtostrf(tempF, 4, 1, buf);
+  u8g2.print(buf);
+  u8g2.print(F("\xb0" "F"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void displayFault() {
+  u8g2.setFont(u8g2_font_6x10_tr);
+  u8g2.setCursor(0, 10);
+  u8g2.print(F("!! TC FAULT !!"));
+  u8g2.setCursor(0, 22);
+  u8g2.print(F("Check probe wiring"));
+  u8g2.setCursor(0, 32);
+  u8g2.print(F("Heater DISABLED"));
+}
+
+// ─────────────────────────────────────────────────────────────────────
+void printSerial() {
+  if (sensorFault) {
+    Serial.println(F("SENSOR FAULT — heater off"));
+    return;
+  }
+  Serial.print(F("T: "));
+  Serial.print(tempC, 2);
+  Serial.print(F("C / "));
+  Serial.print(tempF, 2);
+  Serial.print(F("F  SP: "));
+  Serial.print(SETPOINT_C, 1);
+  Serial.print(F("C  Heat: "));
+  Serial.print(heatOn ? F("ON") : F("OFF"));
+  Serial.print(F("  AtTemp: "));
+  Serial.println(atTemp ? F("YES") : F("NO"));
+}
